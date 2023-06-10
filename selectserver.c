@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <fcntl.h>
 
 #include "st_proactor.h"
 
@@ -23,8 +24,8 @@ void *get_in_addr(struct sockaddr *sa)
     return &(((struct sockaddr_in6 *)sa)->sin6_addr);
 }
 
-int handle_new_connection(int fd, void *arg);
-int handle_client_message(int fd, void *arg);
+int handle_new_connection(void *arg);
+int handle_client_message(void *arg);
 
 int main(void)
 {
@@ -44,7 +45,8 @@ int main(void)
     struct addrinfo hints, *ai, *p;
 
     // Instantiate the proactor object.
-    proactor_t *proactor = createProactor(NULL);
+    proactor_t *proactor = (proactor_t *) malloc(sizeof(proactor_t));
+    createProactor(proactor);
 
     // get us a socket and bind it
     memset(&hints, 0, sizeof hints);
@@ -67,6 +69,20 @@ int main(void)
 
         // lose the pesky "address already in use" error message
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
+
+        // Set the socket to non-blocking mode
+        int flags = fcntl(listener, F_GETFL, 0);
+        if (flags == -1)
+        {
+            perror("fcntl");
+            exit(EXIT_FAILURE);
+        }
+
+        if (fcntl(listener, F_SETFL, flags | O_NONBLOCK) == -1)
+        {
+            perror("fcntl");
+            exit(EXIT_FAILURE);
+        }
 
         if (bind(listener, p->ai_addr, p->ai_addrlen) < 0)
         {
@@ -97,98 +113,21 @@ int main(void)
 
 
     // add the listener to the master set
-    addFD2Proactor(proactor, listener, handle_new_connection, handle_client_message);
+    addFD2Proactor(proactor, listener, handle_new_connection);
 
     // keep track of the biggest file descriptor
     proactor->maxfd = listener; // so far, it's this one
-
+    proactor->server_listener = listener;
     // run the proactor
+
+    proactor->handle_new_connection = handle_new_connection;
+    proactor->handle_new_message = handle_client_message;
+    
     runProactor(proactor);
 
-    fd_set read_fds; // temp file descriptor list for select()
+    sleep(1);
 
-    // main loop
-    for (;;)
-    {
-        read_fds = proactor->fds; // copy it
-        if (select(proactor->maxfd + 1, &read_fds, NULL, NULL, NULL) == -1)
-        {
-            perror("select");
-            exit(4);
-        }
-
-        // run through the existing connections looking for data to read
-        for (i = 0; i <= proactor->maxfd; i++)
-        {
-            if (FD_ISSET(i, &read_fds))
-            { // we got one!!
-                if (i == listener)
-                {
-                    // handle new connections
-                    addrlen = sizeof remoteaddr;
-                    newfd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);
-
-                    if (newfd == -1)
-                    {
-                        perror("accept");
-                    }
-                    else
-                    {
-                        addFD2Proactor(proactor, newfd, handle_new_connection, handle_client_message);
-                        if (newfd > proactor->maxfd)
-                        { // keep track of the max
-                            proactor->maxfd = newfd;
-                        }
-                        printf("selectserver: new connection from %s on socket %d\n",
-                               inet_ntop(remoteaddr.ss_family, get_in_addr((struct sockaddr *)&remoteaddr), remoteIP, INET6_ADDRSTRLEN), newfd);
-                        printf("\n Number of users online is %d\n", proactor->count-1); // not include the listener
-                    }
-                }
-                else
-                {
-                    // handle data from a client
-                    if ((nbytes = recv(i, buf, sizeof buf, 0)) <= 0)
-                    {
-                        // got error or connection closed by client
-                        if (nbytes == 0)
-                        {
-                            // connection closed
-                            printf("selectserver: socket %d hung up\n", i);
-                        }
-                        else
-                        {
-                            perror("recv");
-                        }
-                        close(i); // bye!
-                        removeHandler(proactor, i);
-                        printf("\n Number of users online is %d\n", proactor->count-1); // not include the listener
-                    }
-                    else
-                    {
-                        // we got some data from a client
-                        for (j = 0; j <= proactor->maxfd; j++)
-                        {
-                            // send to everyone!
-                            if (FD_ISSET(j, &proactor->fds))
-                            {
-                                // except the listener and ourselves
-                                if (j != listener && j != i)
-                                {
-                                    if (send(j, buf, nbytes, 0) == -1)
-                                    {
-                                        perror("send");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } // END handle data from client
-            }     // END got new incoming connection
-        }         // END looping through file descriptors
-    }             // END for(;;)--and you thought it would never end!
-
-
-
+    pthread_join((pthread_t)&proactor->thread, NULL);
 
     // Close the listener socket when finished
     close(listener);
@@ -198,8 +137,10 @@ int main(void)
 
     return 0;
 }
+
+
 // This function handles new connections
-int handle_new_connection(int fd, void *arg)
+int handle_new_connection(void *arg)
 {
     // Convert arg to proactor pointer
     proactor_t *proactor = (proactor_t *)arg;
@@ -207,8 +148,7 @@ int handle_new_connection(int fd, void *arg)
     struct sockaddr_storage remoteaddr; // client address
     socklen_t addrlen = sizeof remoteaddr;
     char remoteIP[INET6_ADDRSTRLEN];
-
-    int newfd = accept(fd, (struct sockaddr *)&remoteaddr, &addrlen);
+    int newfd = accept(proactor->current_hot_fd, (struct sockaddr *)&remoteaddr, &addrlen);
     if (newfd == -1)
     {
         perror("accept");
@@ -216,39 +156,43 @@ int handle_new_connection(int fd, void *arg)
     }
     else
     {
+        proactor->count++;
         // add the new connection to the proactor
-        addFD2Proactor(proactor, newfd, handle_client_message, NULL);
+        addFD2Proactor(proactor, newfd, proactor->handle_new_message);
         printf("selectserver: new connection from %s on socket %d\n",
                inet_ntop(remoteaddr.ss_family,
                          get_in_addr((struct sockaddr *)&remoteaddr), remoteIP, INET6_ADDRSTRLEN), newfd);
+        printf("\n Number of users online is %d\n", proactor->count); // not include the listener
     }
     return 0;
 }
 
 // This function handles data from a client
-int handle_client_message(int fd, void *arg)
+int handle_client_message(void *arg)
 {
     // Convert arg to proactor pointer
     proactor_t *proactor = (proactor_t *)arg;
+    if(proactor==NULL)
+    {
+        return -1;
+    }
 
     char buf[256]; // buffer for client data
     int nbytes;
-
-    nbytes = recv(fd, buf, sizeof buf, 0);
+    
+    // printf("current Hot fd = %d\n", proactor->current_hot_fd);
+    nbytes = recv(proactor->current_hot_fd, buf, sizeof buf, 0);
     if (nbytes <= 0)
     {
         // got error or connection closed by client
         if (nbytes == 0)
         {
             // connection closed
-            printf("selectserver: socket %d hung up\n", fd);
+            printf("selectserver: socket %d hung up\n", proactor->current_hot_fd);
         }
-        else
-        {
-            perror("recv");
-        }
-        close(fd); // bye!
-        removeHandler(proactor, fd);
+        close(proactor->current_hot_fd); // bye!
+        removeHandler(proactor, proactor->current_hot_fd);
+        printf("\n Number of users online is %d\n", proactor->count);
         return -1;
     }
     else
@@ -260,7 +204,7 @@ int handle_client_message(int fd, void *arg)
             if (FD_ISSET(j, &proactor->fds))
             {
                 // except the listener and ourselves
-                if (j != fd)
+                if (j != proactor->current_hot_fd && j != proactor->server_listener)
                 {
                     if (send(j, buf, nbytes, 0) == -1)
                     {
